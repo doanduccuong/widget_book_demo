@@ -1,0 +1,258 @@
+name: Update Wiki on main updates and PR merges
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: "update-wiki"
+  cancel-in-progress: true
+
+jobs:
+  update_wiki:
+    if: |
+      (github.event_name == 'push') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve PR context (if any)
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            let prBody = '';
+            let prTitle = '';
+            let prNumber = '';
+            let prUrl = '';
+            let found = false;
+
+            if (context.eventName === 'pull_request') {
+              const pr = context.payload.pull_request;
+              found = true;
+              prBody = pr.body || '';
+              prTitle = pr.title || '';
+              prNumber = String(pr.number);
+              prUrl = pr.html_url || '';
+            } else if (context.eventName === 'push') {
+              const sha = context.payload.after || context.sha;
+
+              try {
+                const prs = await github.request('GET /repos/{owner}/{repo}/commits/{ref}/pulls', {
+                  owner,
+                  repo,
+                  ref: sha,
+                  headers: { 'X-GitHub-Api-Version': '2022-11-28' }
+                });
+
+                const pr = (prs.data || []).find(p => p.merged_at && p.base && p.base.ref === 'main')
+                        || (prs.data || [])[0];
+
+                if (pr) {
+                  const full = await github.rest.pulls.get({ owner, repo, pull_number: pr.number });
+                  found = true;
+                  prBody = full.data.body || '';
+                  prTitle = full.data.title || '';
+                  prNumber = String(full.data.number);
+                  prUrl = full.data.html_url || '';
+                }
+              } catch (e) {}
+
+              if (!found) {
+                prTitle = context.payload.head_commit?.message || `Update ${sha.substring(0, 7)}`;
+              }
+            }
+
+            core.setOutput('found', found ? 'true' : 'false');
+            core.setOutput('body', prBody);
+            core.setOutput('title', prTitle);
+            core.setOutput('number', prNumber);
+            core.setOutput('url', prUrl);
+
+      - name: Checkout Wiki repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}.wiki
+          token: ${{ secrets.WIKI_TOKEN || github.token }}
+          path: wiki
+
+      - name: Update Widgetbook Wiki page
+        env:
+          PR_FOUND: ${{ steps.pr.outputs.found }}
+          PR_BODY: ${{ steps.pr.outputs.body }}
+          PR_TITLE: ${{ steps.pr.outputs.title }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          OWNER: ${{ github.repository_owner }}
+          PAGE: wiki/Widgetbook.md
+        run: |
+          set -e
+
+          export WIDGETBOOK_URL="https://${OWNER}.github.io/${REPO_NAME}/"
+          export TODAY="$(date -u +%Y-%m-%d)"
+
+          python3 - <<'PY'
+          import os, re
+
+          page = os.environ["PAGE"]
+          widgetbook_url = os.environ["WIDGETBOOK_URL"]
+          today = os.environ["TODAY"]
+
+          pr_found = os.environ.get("PR_FOUND") == "true"
+          body = os.environ.get("PR_BODY", "") or ""
+          pr_title = os.environ.get("PR_TITLE", "") or ""
+          pr_number = os.environ.get("PR_NUMBER", "") or ""
+          pr_url = os.environ.get("PR_URL", "") or ""
+
+          def ensure_page(text: str) -> str:
+            if text.strip():
+              return text
+            return (
+              "# Widgetbook\n\n"
+              f"**Live:** {widgetbook_url}\n\n"
+              "## New components\n\n"
+              "## Updated components\n"
+            )
+
+          def ensure_live_link(text: str) -> str:
+            lines = text.splitlines()
+            live_line = f"**Live:** {widgetbook_url}"
+            for i, ln in enumerate(lines):
+              if ln.startswith("**Live:**"):
+                lines[i] = live_line
+                return "\n".join(lines).rstrip() + "\n"
+            if lines and lines[0].startswith("# "):
+              lines.insert(1, "")
+              lines.insert(2, live_line)
+              lines.insert(3, "")
+            else:
+              lines.insert(0, live_line)
+              lines.insert(1, "")
+            return "\n".join(lines).rstrip() + "\n"
+
+          def split_lines_keepends(text: str):
+            return text.splitlines(True) if text else []
+
+          def find_section(lines, header):
+            idx = None
+            for i, ln in enumerate(lines):
+              if ln.strip() == f"## {header}":
+                idx = i
+                break
+            if idx is None:
+              if lines and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
+              lines.append(f"\n## {header}\n")
+              idx = len(lines) - 1
+
+            start = idx + 1
+            end = len(lines)
+            for j in range(start, len(lines)):
+              if lines[j].startswith("## "):
+                end = j
+                break
+            return idx, start, end
+
+          def upsert(lines, header, comp_id, entry_line):
+            _, start, end = find_section(lines, header)
+            marker = f"`{comp_id}`"
+            for i in range(start, end):
+              if marker in lines[i]:
+                lines[i] = entry_line + "\n"
+                return
+            lines.insert(start, entry_line + "\n")
+
+          def parse_components(pr_body: str):
+            is_new = bool(re.search(r"-\s*\[[xX]\]\s*New component", pr_body))
+            is_edit = bool(re.search(r"-\s*\[[xX]\]\s*Edit existing component", pr_body))
+            change_type = "new" if is_new else ("edit" if is_edit else "edit")
+
+            m = re.search(r"##\s*Component\(s\)([\s\S]*?)(\n##|\n$)", pr_body)
+            section = m.group(1) if m else ""
+
+            block_re = re.compile(
+              r"-\s*id:\s*\"?([^\n\"]+)\"?\s*\n"
+              r"\s*name:\s*\"?([^\n\"]+)\"?\s*\n"
+              r"\s*widgetbook_path:\s*\"?([^\n\"]*)\"?\s*\n"
+              r"\s*change_summary:\s*\"?([^\n\"]*)\"?\s*(?:\n|$)",
+              re.MULTILINE
+            )
+
+            comps = []
+            for mm in block_re.finditer(section):
+              comps.append({
+                "id": mm.group(1).strip(),
+                "name": mm.group(2).strip(),
+                "path": mm.group(3).strip(),
+                "summary": mm.group(4).strip(),
+              })
+
+            return change_type, comps
+
+          try:
+            with open(page, "r", encoding="utf-8") as f:
+              text = f.read()
+          except FileNotFoundError:
+            text = ""
+
+          text = ensure_page(text)
+          text = ensure_live_link(text)
+          lines = split_lines_keepends(text)
+
+          find_section(lines, "New components")
+          find_section(lines, "Updated components")
+
+          if pr_found:
+            change_type, comps = parse_components(body)
+            section_name = "New components" if change_type == "new" else "Updated components"
+
+            if not comps:
+              comps = [{
+                "id": "UNKNOWN",
+                "name": pr_title or "Update",
+                "path": "",
+                "summary": "",
+              }]
+
+            for c in comps:
+              cid = c["id"] or "UNKNOWN"
+              name = c["name"] or cid
+              path = c["path"]
+              summary = c["summary"]
+
+              parts = [f"- {today} — **{name}** (`{cid}`)"]
+              if path:
+                parts.append(f"— Path: `{path}`")
+              if summary:
+                parts.append(f"— {summary}")
+              if pr_number and pr_url:
+                parts.append(f"— [PR #{pr_number}]({pr_url})")
+
+              upsert(lines, section_name, cid, " ".join(parts))
+
+          with open(page, "w", encoding="utf-8") as f:
+            f.write("".join(lines))
+          PY
+
+      - name: Commit & push Wiki changes
+        run: |
+          cd wiki
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Update Widgetbook wiki"
+          git push
