@@ -85,7 +85,7 @@ jobs:
           token: ${{ secrets.WIKI_TOKEN || github.token }}
           path: wiki
 
-      - name: Update Widgetbook Wiki page
+      - name: Update Widgetbook Wiki (index + component pages + sidebar)
         env:
           PR_FOUND: ${{ steps.pr.outputs.found }}
           PR_BODY: ${{ steps.pr.outputs.body }}
@@ -94,7 +94,10 @@ jobs:
           PR_URL: ${{ steps.pr.outputs.url }}
           REPO_NAME: ${{ github.event.repository.name }}
           OWNER: ${{ github.repository_owner }}
-          PAGE: wiki/Widgetbook.md
+
+          PAGE_INDEX: wiki/Widgetbook.md
+          COMP_DIR: wiki/Widgetbook
+          SIDEBAR: wiki/_Sidebar.md
         run: |
           set -e
 
@@ -103,8 +106,12 @@ jobs:
 
           python3 - <<'PY'
           import os, re
+          from pathlib import Path
 
-          page = os.environ["PAGE"]
+          index_page = Path(os.environ["PAGE_INDEX"])
+          comp_dir = Path(os.environ["COMP_DIR"])
+          sidebar_page = Path(os.environ["SIDEBAR"])
+
           widgetbook_url = os.environ["WIDGETBOOK_URL"]
           today = os.environ["TODAY"]
 
@@ -114,12 +121,23 @@ jobs:
           pr_number = os.environ.get("PR_NUMBER", "") or ""
           pr_url = os.environ.get("PR_URL", "") or ""
 
-          def ensure_page(text: str) -> str:
+          def safe_slug(s: str) -> str:
+            s = (s or "").strip()
+            if not s:
+              return "UNKNOWN"
+            # keep it wiki/file safe
+            s = re.sub(r"\s+", "-", s)
+            s = re.sub(r"[^A-Za-z0-9._\-]", "-", s)
+            s = re.sub(r"-{2,}", "-", s).strip("-")
+            return s or "UNKNOWN"
+
+          def ensure_index(text: str) -> str:
             if text.strip():
               return text
             return (
               "# Widgetbook\n\n"
               f"**Live:** {widgetbook_url}\n\n"
+              "## Components\n\n"
               "## New components\n\n"
               "## Updated components\n"
             )
@@ -191,27 +209,170 @@ jobs:
             comps = []
             for mm in block_re.finditer(section):
               comps.append({
-                "id": mm.group(1).strip(),
-                "name": mm.group(2).strip(),
-                "path": mm.group(3).strip(),
-                "summary": mm.group(4).strip(),
+                "id": (mm.group(1) or "").strip(),
+                "name": (mm.group(2) or "").strip(),
+                "path": (mm.group(3) or "").strip(),
+                "summary": (mm.group(4) or "").strip(),
               })
 
             return change_type, comps
 
+          def ensure_sidebar(text: str) -> str:
+            if text.strip():
+              return text
+            return (
+              "* [Home](Home)\n"
+              "* [Widgetbook](Widgetbook)\n"
+            )
+
+          def upsert_sidebar(lines, page_link: str, display_name: str, group_header="* [Widgetbook](Widgetbook)"):
+            # Ensure group exists
+            if not any(ln.strip() == group_header for ln in lines):
+              if lines and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
+              if lines and lines[-1].strip() != "":
+                lines.append("\n")
+              lines.append(group_header + "\n")
+
+            # Find insertion area (under Widgetbook group until next top-level bullet not indented)
+            gidx = next(i for i, ln in enumerate(lines) if ln.strip() == group_header)
+            start = gidx + 1
+            end = len(lines)
+            for j in range(start, len(lines)):
+              if lines[j].startswith("* ") and not lines[j].startswith("  * "):
+                end = j
+                break
+
+            entry = f"  * [{display_name}]({page_link})"
+            # Update if existing link
+            for i in range(start, end):
+              if f"]({page_link})" in lines[i]:
+                lines[i] = entry + "\n"
+                return
+
+            # Insert at top of Widgetbook children
+            lines.insert(start, entry + "\n")
+
+          def ensure_component_page(path: Path, name: str, cid: str, wb_path: str, summary: str):
+            title = name or cid
+            header = (
+              f"# {title}\n\n"
+              f"**ID:** `{cid}`\n\n"
+              + (f"**Widgetbook path:** `{wb_path}`\n\n" if wb_path else "")
+              + f"**Live:** {widgetbook_url}\n\n"
+              "## Change log\n"
+            )
+            if not path.exists():
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(header, encoding="utf-8")
+              return
+
+            # If exists, keep content but ensure top metadata lines are updated if present
+            text = path.read_text(encoding="utf-8")
+            if not text.strip():
+              path.write_text(header, encoding="utf-8")
+              return
+
+            lines = text.splitlines(True)
+
+            # Ensure title
+            if lines and lines[0].startswith("# "):
+              lines[0] = f"# {title}\n"
+            else:
+              lines.insert(0, f"# {title}\n")
+              lines.insert(1, "\n")
+
+            # Helper to upsert a metadata line (exact prefix match)
+            def upsert_meta(prefix: str, value_line: str):
+              for i, ln in enumerate(lines[:40]):
+                if ln.startswith(prefix):
+                  lines[i] = value_line + "\n"
+                  return True
+              # insert after title block
+              insert_at = 2 if len(lines) >= 2 else len(lines)
+              lines.insert(insert_at, value_line + "\n")
+              lines.insert(insert_at + 1, "\n")
+              return True
+
+            upsert_meta("**ID:**", f"**ID:** `{cid}`")
+            if wb_path:
+              upsert_meta("**Widgetbook path:**", f"**Widgetbook path:** `{wb_path}`")
+            upsert_meta("**Live:**", f"**Live:** {widgetbook_url}")
+
+            # Ensure "## Change log"
+            if not any(ln.strip() == "## Change log" for ln in lines):
+              if not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
+              lines.append("\n## Change log\n")
+
+            path.write_text("".join(lines).rstrip() + "\n", encoding="utf-8")
+
+          def upsert_changelog(path: Path, cid: str, summary: str, pr_number: str, pr_url: str):
+            text = path.read_text(encoding="utf-8") if path.exists() else ""
+            lines = split_lines_keepends(text)
+
+            # Find Change log section
+            idx = None
+            for i, ln in enumerate(lines):
+              if ln.strip() == "## Change log":
+                idx = i
+                break
+            if idx is None:
+              if lines and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
+              lines.append("\n## Change log\n")
+              idx = len(lines) - 1
+
+            start = idx + 1
+            end = len(lines)
+            for j in range(start, len(lines)):
+              if lines[j].startswith("## "):
+                end = j
+                break
+
+            parts = [f"- {today}"]
+            if summary:
+              parts.append(f"— {summary}")
+            if pr_number and pr_url:
+              parts.append(f"— [PR #{pr_number}]({pr_url})")
+            entry = " ".join(parts)
+
+            # If already has same PR, replace; else insert at top
+            pr_marker = f"[PR #{pr_number}]" if pr_number else None
+            if pr_marker:
+              for i in range(start, end):
+                if pr_marker in lines[i]:
+                  lines[i] = entry + "\n"
+                  path.write_text("".join(lines).rstrip() + "\n", encoding="utf-8")
+                  return
+
+            lines.insert(start, entry + "\n")
+            path.write_text("".join(lines).rstrip() + "\n", encoding="utf-8")
+
+          # ---- load/create index ----
           try:
-            with open(page, "r", encoding="utf-8") as f:
-              text = f.read()
+            index_text = index_page.read_text(encoding="utf-8")
           except FileNotFoundError:
-            text = ""
+            index_text = ""
 
-          text = ensure_page(text)
-          text = ensure_live_link(text)
-          lines = split_lines_keepends(text)
+          index_text = ensure_index(index_text)
+          index_text = ensure_live_link(index_text)
+          index_lines = split_lines_keepends(index_text)
 
-          find_section(lines, "New components")
-          find_section(lines, "Updated components")
+          # Ensure sections exist
+          find_section(index_lines, "Components")
+          find_section(index_lines, "New components")
+          find_section(index_lines, "Updated components")
 
+          # ---- load/create sidebar ----
+          try:
+            sidebar_text = sidebar_page.read_text(encoding="utf-8")
+          except FileNotFoundError:
+            sidebar_text = ""
+          sidebar_text = ensure_sidebar(sidebar_text)
+          sidebar_lines = split_lines_keepends(sidebar_text)
+
+          # ---- apply PR changes ----
           if pr_found:
             change_type, comps = parse_components(body)
             section_name = "New components" if change_type == "new" else "Updated components"
@@ -225,23 +386,43 @@ jobs:
               }]
 
             for c in comps:
-              cid = c["id"] or "UNKNOWN"
-              name = c["name"] or cid
-              path = c["path"]
-              summary = c["summary"]
+              raw_cid = c["id"] or "UNKNOWN"
+              cid = safe_slug(raw_cid)
+              name = c["name"] or raw_cid or cid
+              wb_path = c["path"] or ""
+              summary = c["summary"] or ""
 
-              parts = [f"- {today} — **{name}** (`{cid}`)"]
-              if path:
-                parts.append(f"— Path: `{path}`")
+              # Create/update component page
+              comp_page = comp_dir / f"{cid}.md"
+              ensure_component_page(comp_page, name, cid, wb_path, summary)
+              upsert_changelog(comp_page, cid, summary, pr_number, pr_url)
+
+              # Link used in wiki: "Widgetbook/<cid>"
+              wiki_link = f"Widgetbook/{cid}"
+
+              # Update index: Components list (always)
+              comp_entry = f"- [{name}]({wiki_link}) (`{cid}`)" + (f" — Path: `{wb_path}`" if wb_path else "")
+              upsert(index_lines, "Components", cid, comp_entry)
+
+              # Update index: New/Updated list (recent)
+              recent_parts = [f"- {today} — [{name}]({wiki_link}) (`{cid}`)"]
+              if wb_path:
+                recent_parts.append(f"— Path: `{wb_path}`")
               if summary:
-                parts.append(f"— {summary}")
+                recent_parts.append(f"— {summary}")
               if pr_number and pr_url:
-                parts.append(f"— [PR #{pr_number}]({pr_url})")
+                recent_parts.append(f"— [PR #{pr_number}]({pr_url})")
+              upsert(index_lines, section_name, cid, " ".join(recent_parts))
 
-              upsert(lines, section_name, cid, " ".join(parts))
+              # Update sidebar
+              upsert_sidebar(sidebar_lines, wiki_link, name)
 
-          with open(page, "w", encoding="utf-8") as f:
-            f.write("".join(lines))
+          # ---- write back ----
+          index_page.parent.mkdir(parents=True, exist_ok=True)
+          index_page.write_text("".join(index_lines).rstrip() + "\n", encoding="utf-8")
+
+          sidebar_page.parent.mkdir(parents=True, exist_ok=True)
+          sidebar_page.write_text("".join(sidebar_lines).rstrip() + "\n", encoding="utf-8")
           PY
 
       - name: Commit & push Wiki changes
