@@ -139,6 +139,7 @@ class _InputNormalState extends State<InputNormal> {
                     widget.enabledBorder ??
                     OutlineInputBorder(
                       borderRadius: BorderRadius.circular(8.px),
+
                       borderSide: BorderSide(width: 1.px, color: colorGrayGray4),
                     ),
                 focusedBorder: OutlineInputBorder(
