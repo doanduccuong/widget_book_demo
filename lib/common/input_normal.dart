@@ -122,6 +122,7 @@ class _InputNormalState extends State<InputNormal> {
                     : Padding(
 
 
+
                         padding: EdgeInsets.only(right: 8.px, left: 16.px),
                         child: widget.prefixIcon,
                       ),
