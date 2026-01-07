@@ -180,6 +180,7 @@ class AppButton extends StatelessWidget {
         case AppButtonColor.red:
         case AppButtonColor.purple:
         case AppButtonColor.yellow:
+
         case AppButtonColor.white:
         case AppButtonColor.green:
           return disable ? colorGrayGray4 : colorGrayWhite;
