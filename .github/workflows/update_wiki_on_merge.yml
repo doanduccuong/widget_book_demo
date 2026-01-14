@@ -30,6 +30,38 @@ jobs:
             core.setOutput('number', String(pr.number));
             core.setOutput('url', pr.html_url || '');
 
+      # ------------------------------------------------------------
+      # Validate PR template
+      # ------------------------------------------------------------
+      - name: Validate PR template
+        run: |
+          BODY_FILE="$(mktemp)"
+
+          cat > "$BODY_FILE" <<'EOF'
+          ${{ steps.pr.outputs.body }}
+          EOF
+
+          if [ ! -s "$BODY_FILE" ]; then
+            echo "PR body is empty. Required template is missing."
+            exit 1
+          fi
+
+          REQUIRED_SECTIONS=(
+            "## Component(s)"
+            "## Parameters Used"
+            "## Screenshots"
+          )
+
+          for section in "${REQUIRED_SECTIONS[@]}"; do
+            if ! grep -Fq "$section" "$BODY_FILE"; then
+              echo "Missing required section: $section"
+              echo "PR does not follow the required template. Wiki update cancelled."
+              exit 1
+            fi
+          done
+
+          echo "PR template validation passed."
+
       - name: Checkout Wiki repo
         uses: actions/checkout@v4
         with:
