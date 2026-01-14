@@ -159,6 +159,8 @@ class AppButton extends StatelessWidget {
     } else {
       if ([AppButtonType.outlined, AppButtonType.text].contains(type)) {
         switch (color) {
+
+
           case AppButtonColor.blue:
             return disable ? colorGrayGray5 : colorAlertBlue;
           case AppButtonColor.red:
